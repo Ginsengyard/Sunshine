@@ -2094,7 +2094,7 @@ namespace platf::dxgi {
       }
     } else if (adapter_desc.VendorId == 0x8086) {  // Intel
       // If it's not a QSV encoder, it's not compatible with an Intel GPU
-      if (!boost::algorithm::ends_with(name, "_qsv")) {
+      if (!boost::algorithm::ends_with(name, "_qsv") && !boost::algorithm::ends_with(name, "_mf")) {
         return false;
       }
       if (config.chromaSamplingType == 1) {

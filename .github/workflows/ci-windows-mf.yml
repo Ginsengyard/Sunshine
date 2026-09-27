@@ -8,12 +8,15 @@ on:
       - mf-mft
   workflow_dispatch:
 
-# Nothing to build differently here: the vendor whitelist is already relaxed in
-# src/platform/windows/display_vram.cpp on this branch, so just call upstream's
-# Windows job and let it package the patched tree.
+# The vendor whitelist is already relaxed in src/platform/windows/display_vram.cpp
+# on this branch, so just call upstream's Windows job and let it package that
+# tree.  permissions must be granted on this job as well: the caller's grant caps
+# what a reusable workflow may ask for, and omitting it means startup_failure.
 jobs:
   windows:
     name: Windows
+    permissions:
+      contents: read
     uses: ./.github/workflows/ci-windows.yml
     with:
       publish_release: 'false'

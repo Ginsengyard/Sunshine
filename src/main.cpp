@@ -27,6 +27,7 @@
 #include <rs.h>
 #ifdef _WIN32
   #include <libvirtualhid/license.hpp>
+  #include <windows.h>
 #endif
 
 // local includes
@@ -176,6 +177,33 @@ void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) 
  * @return Process or platform callback exit code.
  */
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+  // Hold a Media Foundation platform reference for the lifetime of the process.
+  //
+  // The Intel QSV H.264 encoder MFT (Ivy Bridge and similar) fails the first
+  // IMFTransform::SetOutputType() call of every MFStartup() epoch with
+  // MF_E_INVALIDMEDIATYPE. That first call only arms the driver; later encoder
+  // instances in the same epoch succeed. FFmpeg's mfenc wraps every encoder open
+  // in MFStartup()/MFShutdown(), and MFShutdown() tears the platform down again
+  // when the reference count reaches zero, so every probe attempt starts a fresh
+  // epoch and the hardware encoder can never open.
+  //
+  // Keeping one reference alive here (MFStartup/MFShutdown are reference counted)
+  // makes all encoder opens share a single epoch, so the encoder works from the
+  // second attempt onwards. See docs/mf-experiment.md for the full evidence.
+  {
+    static bool mf_platform_held = false;
+    if (!mf_platform_held) {
+      mf_platform_held = true;
+      if (auto mfplat = LoadLibraryW(L"mfplat.dll")) {
+        using mf_startup_t = long(__stdcall *)(unsigned long, unsigned long);
+        if (auto mf_startup = reinterpret_cast<mf_startup_t>(GetProcAddress(mfplat, "MFStartup"))) {
+          mf_startup(0x20070 /* MF_VERSION */, 0 /* MFSTARTUP_FULL */);
+        }
+      }
+    }
+  }
+#endif
 #ifdef __linux__
   const bool privileged_execution = getauxval(AT_SECURE) != 0 || platf::has_elevated_privileges(true);
   if (privileged_execution && !platf::sanitize_process_environment()) {

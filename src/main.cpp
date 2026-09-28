@@ -27,7 +27,6 @@
 #include <rs.h>
 #ifdef _WIN32
   #include <libvirtualhid/license.hpp>
-  #include <windows.h>
 #endif
 
 // local includes

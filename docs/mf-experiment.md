@@ -1,18 +1,18 @@
 # Sunshine × ThinkPad E531：MediaFoundation 硬编实验档案
 
 > 日期：2026-09-27 ~ 09-29。机器：ThinkPad E531 (68854UC)，i7-3740QM + HD 4000（驱动 10.18.10.5161，**独占所有显示输出**）+ GT 740M / GK208M（`PCI\VEN_10DE&DEV_1292&SUBSYS_501917AA`，驱动 25.21.14.1891 = 418.91），muxless Optimus。
-> 一句话结论：**MF 路线已打通**——白名单放行 + 进程启动时持有一个 MF 平台引用后，`Found H.264 encoder: h264_mf [mediafoundation]` 实测成立（两次复现，非提权）。根因：Intel QSV MFT 在每个 MFStartup 纪元内的**首次** `IMFTransform::SetOutputType()` 必败（`MF_E_INVALIDMEDIATYPE`，仅"打火"），同纪元内后续实例成功。
+> 一句话结论：**MF 路线已打通并端到端验证**——白名单放行 + `main()` 持有 MF 平台引用后，Intel QSV MFT 在真实 Moonlight 会话中以 h264_mf 硬编出帧（720p / 1080p 实测成功，非提权与提权皆可）。根因是**双层**的：① 同纪元内前几次 `SetOutputType` 必败（驱动"打火"，由持有引用 + 内置重试吸收）；② 编码器有**硬件能力上限**，客户端请求超出（如 2400x1080@60）会被永久拒收（连败 199 次），需靠客户端分辨率/码率约束或后续降级补丁规避。
 
-## 1. 四条硬编路径状态（每条都有本机实测或源码级证据）
+## 1. 四条硬编路径状态
 
 | 路径 | 状态 | 证据 |
 |---|---|---|
-| NVENC (GT 740M) | 死 | notebook 驱动上限 425.31 → NVENC API 9.0；Sunshine/Apollo 要求 ≥11.0（456.71+）。`nvEncodeAPI64.dll!NvEncodeAPIGetMaxSupportedVersion` P/Invoke 实测 `RAW=0x00000090`；425.31-notebook INF 含 `DEV_1292&SUBSYS_501917AA`，461.09-notebook 不含 |
-| QSV (HD 4000, oneVPL) | 死 | oneVPL 在 `CheckValidLibraries()` 过滤 gen7，`MFX_ERR -9`；libmfx 会话本身可建（API 1.27/1.11） |
-| CUDA 通用编码 | 死 | 无 CUDA 编码器路径；GK208 是 sm_35（低于最低 sm_50） |
-| **MediaFoundation（Intel QSV MFT）** | **✅ 已打通（2026-09-29）** | `Found H.264 encoder: h264_mf [mediafoundation]`，probe 两次复现，见 §4.3/§5 |
+| NVENC (GT 740M) | 死 | notebook 驱动上限 425.31 → NVENC API 9.0；Sunshine 要求 ≥11.0（456.71+）。`NvEncodeAPIGetMaxSupportedVersion` P/Invoke 实测 `RAW=0x00000090`；425.31-notebook INF 含 `DEV_1292&SUBSYS_501917AA`，461.09-notebook 不含 |
+| QSV (HD 4000, oneVPL) | 死 | oneVPL `CheckValidLibraries()` 过滤 gen7，`MFX_ERR -9`；libmfx 会话可建（API 1.27/1.11）但现代 ffmpeg 已走 libvpl |
+| CUDA 通用编码 | 死 | 无 CUDA 编码器路径；GK208 = sm_35 < sm_50 |
+| **MediaFoundation（Intel QSV MFT）** | **✅ 端到端打通（09-29）** | 720p / 1080p Moonlight 会话实测成功，走 `h264_mf` + Intel QSV MFT；见 §4.3 / §5 |
 
-## 2. MF 路线改了什么（共两处源码补丁）
+## 2. MF 路线改了什么（两处补丁）
 
 ### 2.1 能力判定白名单（commit `f250175`，1 行）
 
@@ -25,7 +25,7 @@
        }
 ```
 
-原因：该函数对 Intel adapter（VendorId 0x8086）只放行 `*_qsv`，使 `h264_mf` 在能力判定阶段就被丢弃（日志特征：`Trying encoder [X]` 后**没有** `Creating encoder [...]`）。补丁后进入会话创建阶段。
+原因：该函数对 Intel adapter（VendorId 0x8086）只放行 `*_qsv`，`h264_mf` 在能力判定阶段即被丢弃（特征：`Trying encoder [X]` 后**没有** `Creating encoder`）。
 
 ### 2.2 持有 MF 平台引用（commit `0183d0bc`，初版 `b71b8336`）
 
@@ -34,10 +34,10 @@
 ```cpp
 #ifdef _WIN32
   // Hold a Media Foundation platform reference for the lifetime of the process.
-  // Intel QSV H.264 encoder MFT fails the first IMFTransform::SetOutputType() call
-  // of every MFStartup() epoch with MF_E_INVALIDMEDIATYPE; that call only arms the
-  // driver. FFmpeg's mfenc wraps every encoder open in MFStartup()/MFShutdown(), so
-  // every open would start a fresh epoch and always fail.
+  // The Intel QSV H.264 encoder MFT fails the first IMFTransform::SetOutputType()
+  // calls of every MFStartup() epoch with MF_E_INVALIDMEDIATYPE; those calls only
+  // arm the driver.  FFmpeg's mfenc wraps every encoder open in
+  // MFStartup()/MFShutdown(), so every open would otherwise start a fresh epoch.
   {
     static bool mf_platform_held = false;
     if (!mf_platform_held) {
@@ -55,87 +55,70 @@
 
 要点：
 
-- MFStartup/MFShutdown 是**引用计数**的。持有一个引用后，mfenc 每次打开编码器时的 MFStartup/MFShutdown 不会真正拆掉平台 → 所有打开共享同一纪元 → 从第二次打开起 `SetOutputType` 不再首败。
-- `validate_encoder()` 对指定编码器本来就做**两次** `validate_config`（先 max-ref-frames、再 autoselect）：第一次消耗"首败"打火，第二次即通过——因此不需要额外的 dummy 预热。
-- **编译坑（重要）**：不要在 boost/asio（会引 `winsock2.h`）之前 include `<windows.h>`，否则 `#error WinSock.h has already been included` 在 `-Werror` 下直接挂（初版 `b71b8336` 就栽在这；`0183d0bc` 删掉了多余 include）。`main()` 里用到的 `LoadLibraryW` 本来就由 `confighttp.h`→boost/asio 链传入的 windows.h 提供（基线同 TU 更高处已用 HWND 等类型，可证）。
+- MFStartup/MFShutdown 引用计数；持有一个引用后所有编码器打开共享同一纪元，"打火"状态不丢失。
+- Sunshine 的会话编码器创建带**重试循环**：720p 会话实测第 1~3 次失败、第 4 次成功；1080p 会话同样在前几次失败后成功。
+- **编译坑**：`-Werror` 下勿在 boost/asio（引入 winsock2.h）之前 include `<windows.h>`——`#error WinSock.h has already been included`（初版 `b71b8336` 栽在这，`0183d0bc` 修复）。
 
 ## 3. CI 与下载的坑（全部踩过）
 
-1. **调用 reusable workflow 的 job 必须显式写 `permissions: contents: read`**；省略则继承调用方 `permissions: {}`，被调方要权限直接 `startup_failure`。
-2. **`ci.yml` 的 `release-setup` 在 fork 上必失败**；要构建就触发自己的包装工作流 `ci-windows-mf.yml`（push 到 `mf-mft` 即触发，矩阵固定 AMD64(gcc/ucrt64) + ARM64(clang/clangarm64)，无参数可裁剪；ARM64 只作编译体检，验证只看 AMD64，别等它）。
-3. fine-grained PAT 不能写 `.github/workflows/`（403）；需 classic PAT 的 workflow scope 或网页 UI。
-4. Actions artifact 匿名下载 404（公开仓库也要登录）；网页端链接是 `.../runs/<id>/artifacts/<aid>`（复数）。
-5. Git Data API：`POST /git/trees` 的 `base_tree` 要 **tree 的 SHA**；`GITHUB_TOKEN` 产生的 commit 不触发 workflow（防递归）。
-6. **artifact 下载限速（本机链路实测）**：单连接 ~25–30 KB/s（直连/代理皆然），且**限速按连接**——8 路并行线性叠加（≈0.26 MB/s），**16 路并发整体停滞（0 字节）**；代理健康检查通过后仍可能 TLS 失败（exit 35），批量下载前先做一次可用性探测并支持直连回退。
-7. **只取所需成员**：`build-Windows-AMD64.zip`(227MB) 内 lite.zip 仅 38MB（另 156MB debuginfo、33MB MSI）。用 HTTP Range 读尾部 EOCD + 中央目录，再按 Range 拉单个成员并 inflate（`mf_fetch_lite.ps1`），下载量降到 1/6，2 分钟拿到包。注意 PowerShell 里 `0xFFFFFFFF -ge ...` 会被当 **int32 的 -1**，zip64 判断要用 `[uint32]::MaxValue`。
+1. 调用 reusable workflow 的 job 必须显式 `permissions: contents: read`，否则 `startup_failure`。
+2. `ci.yml` 的 release-setup 在 fork 上必失败；用包装工作流 `ci-windows-mf.yml`（push `mf-mft` 即触发；矩阵固定 AMD64 + ARM64，验证只看 AMD64）。
+3. fine-grained PAT 不能写 `.github/workflows/`（403）；`GITHUB_TOKEN` 产生的 commit 不触发 workflow。
+4. Actions artifact 匿名下载 404（公开仓库也要登录）。
+5. **下载限速按连接**：单连接 ~25–30 KB/s（直连/代理皆然）；8 路并行线性叠加（≈0.26 MB/s），**16 路并发整体停滞（0 字节）**；代理健康检查通过后仍可能 TLS 失败（exit 35）→ 下载前先探测可用性、支持直连回退。
+6. **只取所需成员**：227MB 的 `build-Windows-AMD64.zip` 里 lite.zip 仅 38MB（另 156MB 是 debuginfo、33MB 是 MSI）。用 HTTP Range 读 EOCD + 中央目录，只拉目标成员并 inflate（`mf_fetch_lite.ps1`），数据量降到 1/6，2 分钟拿到包。PowerShell 里 `0xFFFFFFFF -ge` 是 **int32 的 -1**，zip64 判断要用 `[uint32]::MaxValue`。
 
-## 4. 本机探测方法论与实测结果
+## 4. 本机探测方法学与实测
 
-### 4.1 方法论（可复用）
+### 4.1 方法学
 
-- portable 版配置与日志都在 **`<exe 目录>\config\`**（`src/platform/windows/misc.cpp:149` 的 `appdata()`）。
-- 无凭据时 `http::init()` 失败 → 打 fatal、睡 10s、`return -1` 自退出；而 `video::probe_encoders()` 在它**之前**执行 → **不需要凭据就能拿到探测日志**。
-- 判据原文（`src/video.cpp`）：`Trying encoder [X]`(3072) / `Creating encoder [Y]`(2601) / `Encoder [X] is not supported on this GPU`(3095) / `Encoder [X] failed`(3074) / `Found H.264 encoder: Y [X]`(3448)。
-- ffmpeg 侧 verbose 日志（`min_log_level = verbose`）会打印 mfenc 的 MFT 枚举与 `setting output type` 全属性。
-- 脚本（本机 `D:\work\qoder01\mfwork\`）：`mf_probe.ps1`、`mf_probe_cs.ps1`（独立 C#/COM 探针矩阵）、`mf_watch_build.ps1`（监视 CI→下载→探测）、`mf_fetch_lite.ps1`（Range 取单成员）、`mf_mft_matrix.ps1`、`mf_intel_hidden.ps1`、`mf_pipeline.py`、`mf_dispatch.py`、`mf_run.ps1`。
+- portable 版配置/日志在 `<exe 目录>\config\`（`src/platform/windows/misc.cpp:149`）。
+- 无凭据时 `http::init()` 失败自退出；`video::probe_encoders()` 在其之前 → 不需要凭据即可拿到探测日志。
+- 判据行（`src/video.cpp`）：`Trying encoder [X]` / `Creating encoder [Y]` / `Encoder [X] is not supported on this GPU` / `Encoder [X] failed` / `Found H.264 encoder: Y [X]`。
+- **verbose 是定位拒收字段的关键武器**：`min_log_level = verbose` 后 mfenc 打印每次 `setting output type` 的全部 `MF_MT_*` 属性。
+- 脚本（`D:\work\qoder01\mfwork\`）：`mf_probe.ps1`（-Elevated）、`mf_probe_cs.ps1`（C#/COM 探针矩阵）、`mf_watch_build.ps1`、`mf_fetch_lite.ps1`、`mf_mft_matrix.ps1`、`mf_intel_hidden.ps1`、`mf_pipeline.py`、`mf_dispatch.py`、`mf_run.ps1`。
 
-### 4.2 三组实验（白名单补丁后）
+### 4.2 硬件可接受集合（ffmpeg CLI 直驱）
 
-1. **补丁生效性**：`Trying encoder [mediafoundation]` → `Creating encoder [h264_mf]` ×2 → `Encoder [mediafoundation] failed`（修复前的状态）。
-2. **Intel MFT 接受集合**（临时改名 `C:\Windows\System32\nvEncMFTH264.dll` 逼 ffmpeg 选 Intel；测完改回）：D3D11 输入 + `hw_encoding=1 -rate_control cbr -scenario display_remoting` 下，1080p60 profile 66/77/100、1080p30 High、720p60 High **全部成功**。即硬件与媒体类型无罪。
-3. **跨 adapter**（临时改名 `C:\Program Files\Intel\Media SDK\mfx_mft_h264ve_64.dll` 逼 Sunshine 选 NVIDIA MFT）：`Could not open codec [h264_mf]: Function not implemented`。跨 adapter 在 Sunshine 内是死的。
+D3D11 输入 + `hw_encoding=1 -rate_control cbr -scenario display_remoting`：1080p60 profile 66/77/100、1080p30 High、720p60 High **全部成功**（临时改名 `nvEncMFTH264.dll` 逼选 Intel，测完改回）。
 
-### 4.3 失败窗口与修复后对照（Sunshine 进程内，verbose）
+### 4.3 端到端会话实测（09-29，Sunshine + Moonlight + verbose）
 
-修复前：
+| 客户端请求 | 结果 | 日志证据 |
+|---|---|---|
+| 1280x720 / 7.3 Mbps | ✅ 成功（两次连接均成功） | 第 1~3 次 `SetOutputType` 失败 → 第 4 次成功；`MFT name: Intel QSV`；全程无 libx264 回退 |
+| 1920x1080 / 20 Mbps | ✅ 成功 | 编码器 input/output 均 1920x1080（NV12）；桌面 1366x768 被 GPU 视频处理器**放大**后再编码（真 1080p 码流、细节仍 768p 源） |
+| 2400x1080 / 47 Mbps | ❌ 永久失败（连败 199 次直到客户端断开） | `setting output type: 2400x1080 @ 46,988,000` → `MF_E_INVALIDMEDIATYPE`；另有 `Client requested reference frame limit, but encoder doesn't support it!` |
 
-```
-Creating encoder [h264_mf]
-MFT name: 'Intel(R) Quick Sync Video H.264 Encoder MFT'   (VEN_8086, ff_MF_SA_D3D11_AWARE=1)
-setting output type: ... MF_MT_SUBTYPE=MFVideoFormat_H264
-Error: could not set output type (MF_E_INVALIDMEDIATYPE)
-Encoder [mediafoundation] failed
-```
+结论：
 
-修复后（2026-09-29，run `36445869005` 产物，`mf_probe.ps1` 实测）：
-
-```
-01:33:20.925  Trying encoder [mediafoundation]
-01:33:21.040  Creating encoder [h264_mf]        <- 第 1 次打开：消耗"首败"
-01:33:21.206    MFT name: 'Intel QSV H.264 Encoder MFT'
-01:33:21.206  Error: could not set output type (MF_E_INVALIDMEDIATYPE)      （预期）
-01:33:21.209  Creating encoder [h264_mf]        <- 第 2 次打开：同一被持有的 MF 纪元
-01:33:21.356    MFT name: 'Intel QSV H.264 Encoder MFT'                     （通过）
-01:33:23.050  Found H.264 encoder: h264_mf [mediafoundation]
-```
+- 会话**首次**连接也可能先失败 1~3 次（驱动打火），重试即成功——预期行为。
+- **超出编码器能力的分辨率会永久失败**：2400x1080@60 宏块吞吐 612,000 MB/s 超出 H.264 Level 5.0（589,824 MB/s），需 Level 5.1；HD 4000 QSV 直接拒收。1920x1080 是已验证可用上限（2400 宽不行）。
+- 客户端请求高于桌面分辨率时 Sunshine 会放大后再编码；建议客户端直接用原生 1366x768 或 1280x720，省码率与负载。
 
 ### 4.4 独立 C#/COM 探针矩阵（根因证据）
 
-`mf_probe_cs.ps1` 在隔离进程里复刻 Sunshine 的调用形态（枚举→激活→SetOutputType），跑参数矩阵：
-
-- 同一实例上重试 SetOutputType 无效；**换新实例**（同进程、同纪元）则成功 → "首败打火"。
-- MFShutdown 后再 MFStartup（新纪元）→ **再次首败**；失败与 MFStartup 纪元绑定。
-- 进程启动时持有一个额外 MFStartup 引用，使 MFShutdown 无法把引用计数降到 0 → 热状态跨"纪元"幸存，后续打开直接成功（T6）。
-- 对照：ffmpeg CLI 直接驱动同一 MFT 首调即成功（探针 0/16 vs CLI 100%）——CLI 进程内可能已有别的 MF 活动先"打火"（**未完全解释，见 §5 注记**）。
+- 同实例重试无效；**换新实例**（同进程）在若干次后成功 → "打火"。
+- `MFShutdown` 后再 `MFStartup`（新纪元）→ 再次首败；失败与纪元绑定。
+- 进程启动时持有一个额外 MFStartup 引用 → 热状态跨纪元幸存（T6）。
 
 ## 5. 结论与残留注记
 
-**根因（已确证）**：Intel QSV H.264 Encoder MFT 在每个 MFStartup 纪元内的首次 `SetOutputType()` 返回 `MF_E_INVALIDMEDIATYPE`（仅"打火"）；mfenc 每次打开编码器都 MFStartup/MFShutdown，使每次打开都落在新纪元 → 永远首败。
+**双层根因**：① 驱动级"打火"（每纪元前几次 SetOutputType 必败）——由 §2.2 持有引用 + Sunshine 内置重试吸收；② 硬件能力上限——请求超出能力（2400x1080@60）时永久拒收，需客户端分辨率约束（或后续的自动降级补丁）。
 
-**修复（已验证）**：进程启动时持有 MF 平台引用（§2.2）→ 所有打开共享纪元 → `validate_encoder` 的第二次 `validate_config` 成功 → 实测 `Found H.264 encoder: h264_mf [mediafoundation]`（两次复现，非提权）。
-
-**残留注记（不影响结论）**：ffmpeg CLI 在同一机器上首调即成功的现象仍未逐位解释；最可能是 CLI 进程内在 mfenc 打开前已有其他 MF/MFT 活动"打火"。Sunshine 的修复不依赖该解释。
+**残留注记**：ffmpeg CLI 首调即成功的现象仍未逐位解释；不影响上述结论。
 
 ## 6. 资产清单
 
-- 远端：fork `Ginsengyard/Sunshine` 分支 `mf-mft`；commits `f250175`(白名单)、`b034781`/`1aac10e1`(工作流)、`a2b97266`、`bf156936`、`b71b8336`(MF 持有初版，含编译坑)、**`0183d0bc`(当前 HEAD：编译修复)**；run `36445869005`（**双架构 success**）；artifact `10982606366`（build-Windows-AMD64）。
-- 本机 `D:\work\qoder01\mfwork\`：`mfb_fix\Sunshine\`（**验证通过的 MF 版可运行包**）、`art_fix\Sunshine-Windows-AMD64-lite.zip`、`probe_result.txt`（VERDICT: SUCCESS）、`probe_result_prefix.txt`（修复前对照）、`mfb\Sunshine\`（旧包）、上述全部脚本、`Sunshine-master\`（源码树）。
+- 远端：fork `Ginsengyard/Sunshine` 分支 `mf-mft`；commits `f250175`(白名单)、`b034781`/`1aac10e1`(工作流)、`a2b97266`、`bf156936`、`b71b8336`(MF 持有初版)、`0183d0bc`(编译修复)、`f96941ec`(文档 v2)、本次文档 v3；run `36445869005`（**双架构 success**）；artifact `10982606366`。
+- 本机 `D:\work\qoder01\mfwork\`：`mfb_fix\Sunshine\`（**验证通过的 MF 版可运行包**，配置含 `min_log_level = verbose`，实测日志在 `config\sunshine.log`）、`art_fix\Sunshine-Windows-AMD64-lite.zip`、`probe_result.txt`（SUCCESS）、`probe_result_success_nonelev.txt`、`sunshine_nonelev.log`（修复前对照）、上述全部脚本、`Sunshine-master\`（源码树）。
 
-## 7. 将来 fork 继续时的上手清单
+## 7. 将来继续时的上手清单
 
-1. `git cherry-pick f250175 0183d0bc`（或照 §2.1/§2.2 手改）；复制 `ci-windows-mf.yml` 并保留 job 级 `permissions: contents: read`。
-2. 触发构建：push 到实验分支即触发 `CI-Windows-MF`（矩阵含 ARM64，验证时只等 AMD64）。
-3. 下载：**别下整个 227MB**，用 `mf_fetch_lite.ps1 -ArtifactId <id>` 只取 lite 成员（Range + 中央目录），8 路并行、别超 12 路；解包后按 §4.1 探测。
-4. 编译注意：`-Werror` 下勿在 boost/asio 之前 include `<windows.h>`（winsock 顺序坑）。
-5. 想换 ffmpeg：`cmake/dependencies/ffmpeg.cmake` 支持 `FFMPEG_PREPARED_BINARIES` / `FFMPEG_ARCHIVE_NAME` 覆盖（预编译二进制来自 LizardByte/build-deps 的 release）。
-6. 任何"改名 System32/Program Files 下 DLL"的实验都必须 finally 改回，并先确认无进程占用。
+1. `git cherry-pick f250175 0183d0bc`；复制 `ci-windows-mf.yml` 并保留 job 级 `permissions: contents: read`。
+2. push `mf-mft` 触发 `CI-Windows-MF`；验证只等 AMD64（ARM64 只是编译体检）。
+3. 下载用 `mf_fetch_lite.ps1 -ArtifactId <id>`（8 路并行，别超 12 路）。
+4. 排障先开 `min_log_level = verbose`，看每次 `setting output type` 的属性与拒收错误。
+5. **客户端分辨率不要超过编码器能力**（本机实测上限 1920x1080；2400x1080 会被永久拒收）。
+6. 编译注意：`-Werror` 下勿在 boost/asio 之前 include `<windows.h>`。
+7. 任何"改名 System32/Program Files 下 DLL"的实验都必须 finally 改回，并先确认无进程占用。

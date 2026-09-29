@@ -2023,11 +2023,13 @@ namespace video {
     // MF encoders also get extra attempts: the Intel QSV MFT fails the first
     // SetOutputType() calls of an epoch while it arms the driver (up to three
     // consecutive failures were observed in a fresh process), and MF codecs
-    // carry no fallback options that would otherwise trigger a retry.
+    // carry no fallback options that would otherwise trigger a retry.  Retries
+    // are spaced out because the MFT is briefly unavailable right after a failed
+    // open (back-to-back attempts fail where a short gap succeeds).
     constexpr int mf_dimension_limit = 1920;
     const bool mf_codec = video_format.name.size() > 3 && video_format.name.substr(video_format.name.size() - 3) == "_mf";
     const bool mf_clamp_available = mf_codec && (config.width > mf_dimension_limit || config.height > mf_dimension_limit);
-    const int max_retries = mf_codec ? 4 : 2;
+    const int max_retries = mf_codec ? 6 : 2;
 
     // Allow up to 1 retry to apply the set of fallback options (MF encoders get
     // the extra attempts allocated in max_retries above).
@@ -2284,6 +2286,10 @@ namespace video {
             << "Retrying "sv << video_format.name << " (attempt "sv << (retries + 2) << '/' << max_retries
             << ") after error: "sv
             << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, status);
+
+          // The MFT is briefly unavailable right after a failed open: wait a
+          // moment instead of retrying back-to-back.
+          std::this_thread::sleep_for(250ms);
 
           continue;
         } else {

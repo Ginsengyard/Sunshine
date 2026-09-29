@@ -2016,20 +2016,27 @@ namespace video {
     // pixels: the MFT rejects such an output type with MF_E_INVALIDMEDIATYPE and
     // the encoder can never be opened.  A client asking for more (phones often
     // request 2400x1080) would then fail every session attempt.  When opening an
-    // *_mf codec fails, retry once with the request scaled down to the limit,
+    // *_mf codec fails, retry with the request scaled down to the limit,
     // preserving the client's aspect ratio.  The retry only engages after a real
     // failure, so encoders whose MFT supports larger frames are unaffected.
+    //
+    // MF encoders also get extra attempts: the Intel QSV MFT fails the first
+    // SetOutputType() calls of an epoch while it arms the driver (up to three
+    // consecutive failures were observed in a fresh process), and MF codecs
+    // carry no fallback options that would otherwise trigger a retry.
     constexpr int mf_dimension_limit = 1920;
     const bool mf_codec = video_format.name.size() > 3 && video_format.name.substr(video_format.name.size() - 3) == "_mf";
     const bool mf_clamp_available = mf_codec && (config.width > mf_dimension_limit || config.height > mf_dimension_limit);
+    const int max_retries = mf_codec ? 4 : 2;
 
-    // Allow up to 1 retry to apply the set of fallback options.
+    // Allow up to 1 retry to apply the set of fallback options (MF encoders get
+    // the extra attempts allocated in max_retries above).
     //
     // Note: If we later end up needing multiple sets of
     // fallback options, we may need to allow more retries
     // to try applying each set.
     avcodec_ctx_t ctx;
-    for (int retries = 0; retries < 2; retries++) {
+    for (int retries = 0; retries < max_retries; retries++) {
       ctx.reset(avcodec_alloc_context3(codec));
       if (retries > 0 && mf_clamp_available) {
         const auto scale = std::min(static_cast<double>(mf_dimension_limit) / config.width, static_cast<double>(mf_dimension_limit) / config.height);
@@ -2272,11 +2279,10 @@ namespace video {
       if (auto status = avcodec_open2(ctx.get(), codec, &options)) {
         char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
 
-        if (retries == 0 && (!video_format.fallback_options.empty() || mf_clamp_available)) {
+        if (retries + 1 < max_retries && (!video_format.fallback_options.empty() || mf_codec)) {
           BOOST_LOG(info)
-            << "Retrying "sv << video_format.name << " with "sv
-            << (video_format.fallback_options.empty() ? "a clamped resolution"sv : "fallback configuration options"sv)
-            << " after error: "sv
+            << "Retrying "sv << video_format.name << " (attempt "sv << (retries + 2) << '/' << max_retries
+            << ") after error: "sv
             << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, status);
 
           continue;

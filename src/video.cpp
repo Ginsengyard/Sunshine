@@ -2011,6 +2011,18 @@ namespace video {
                   (colorspace.bit_depth == 10 && config.chromaSamplingType == 1) ? platform_formats->avcodec_pix_fmt_yuv444_10bit :
                                                                                    AV_PIX_FMT_NONE;
 
+    // Media Foundation encoders on legacy Intel GPUs (Ivy Bridge / HD 4000 and
+    // similar) cannot encode frames wider than 1920 pixels or taller than 1920
+    // pixels: the MFT rejects such an output type with MF_E_INVALIDMEDIATYPE and
+    // the encoder can never be opened.  A client asking for more (phones often
+    // request 2400x1080) would then fail every session attempt.  When opening an
+    // *_mf codec fails, retry once with the request scaled down to the limit,
+    // preserving the client's aspect ratio.  The retry only engages after a real
+    // failure, so encoders whose MFT supports larger frames are unaffected.
+    constexpr int mf_dimension_limit = 1920;
+    const bool mf_codec = video_format.name.size() > 3 && video_format.name.substr(video_format.name.size() - 3) == "_mf";
+    const bool mf_clamp_available = mf_codec && (config.width > mf_dimension_limit || config.height > mf_dimension_limit);
+
     // Allow up to 1 retry to apply the set of fallback options.
     //
     // Note: If we later end up needing multiple sets of
@@ -2019,8 +2031,17 @@ namespace video {
     avcodec_ctx_t ctx;
     for (int retries = 0; retries < 2; retries++) {
       ctx.reset(avcodec_alloc_context3(codec));
-      ctx->width = config.width;
-      ctx->height = config.height;
+      if (retries > 0 && mf_clamp_available) {
+        const auto scale = std::min(static_cast<double>(mf_dimension_limit) / config.width, static_cast<double>(mf_dimension_limit) / config.height);
+        ctx->width = static_cast<int>(config.width * scale) & ~1;
+        ctx->height = static_cast<int>(config.height * scale) & ~1;
+        BOOST_LOG(warning) << video_format.name << ": requested "sv << config.width << 'x' << config.height
+                           << " exceeds the "sv << mf_dimension_limit << " pixel Media Foundation encoder limit, using "sv
+                           << ctx->width << 'x' << ctx->height << " instead"sv;
+      } else {
+        ctx->width = config.width;
+        ctx->height = config.height;
+      }
       const AVRational fps = video::framerate_to_rational(config);
       ctx->framerate = fps;
       ctx->time_base = AVRational {fps.den, fps.num};
@@ -2251,9 +2272,11 @@ namespace video {
       if (auto status = avcodec_open2(ctx.get(), codec, &options)) {
         char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
 
-        if (!video_format.fallback_options.empty() && retries == 0) {
+        if (retries == 0 && (!video_format.fallback_options.empty() || mf_clamp_available)) {
           BOOST_LOG(info)
-            << "Retrying with fallback configuration options for ["sv << video_format.name << "] after error: "sv
+            << "Retrying "sv << video_format.name << " with "sv
+            << (video_format.fallback_options.empty() ? "a clamped resolution"sv : "fallback configuration options"sv)
+            << " after error: "sv
             << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, status);
 
           continue;
